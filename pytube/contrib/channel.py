@@ -2,10 +2,10 @@
 """Module for interacting with a user's youtube channel."""
 import json
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Iterable
 
-from pytube import extract, Playlist, request
-from pytube.helpers import uniqueify
+from pytube import extract, YouTube, Playlist, request
+from pytube.helpers import cache, uniqueify, DeferredGeneratorList
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 class Channel(Playlist):
     def __init__(self, url: str, proxies: Optional[Dict[str, str]] = None):
         """Construct a :class:`Channel <Channel>`.
-
         :param str url:
             A valid YouTube channel URL.
         :param proxies:
@@ -28,10 +27,15 @@ class Channel(Playlist):
         )
 
         self.videos_url = self.channel_url + '/videos'
+        self.shorts_url = self.channel_url + '/shorts'
+        self.live_url = self.channel_url + '/streams'
         self.playlists_url = self.channel_url + '/playlists'
         self.community_url = self.channel_url + '/community'
         self.featured_channels_url = self.channel_url + '/channels'
         self.about_url = self.channel_url + '/about'
+
+        self._html_url = self.videos_url  # Videos will be preferred over short videos and live
+        self._visitor_data = None
 
         # Possible future additions
         self._playlists_html = None
@@ -68,14 +72,33 @@ class Channel(Playlist):
         return self.initial_data['metadata']['channelMetadataRenderer'].get('vanityChannelUrl', None)  # noqa:E501
 
     @property
+    def html_url(self):
+        """Get the html url.
+
+        :rtype: str
+        """
+        return self._html_url
+
+    @html_url.setter
+    def html_url(self, value):
+        """Set the html url and clear the cache."""
+        if self._html_url != value:
+            self._html = None
+            self._initial_data = None
+            self.__class__.video_urls.fget.cache_clear()
+            self.__class__.last_updated.fget.cache_clear()
+            self.__class__.title.fget.cache_clear()
+            self._html_url = value
+
+    @property
     def html(self):
-        """Get the html for the /videos page.
+        """Get the html for the /videos or /shorts page.
 
         :rtype: str
         """
         if self._html:
             return self._html
-        self._html = request.get(self.videos_url)
+        self._html = request.get(self.html_url)
         return self._html
 
     @property
@@ -134,8 +157,41 @@ class Channel(Playlist):
             self._about_html = request.get(self.about_url)
             return self._about_html
 
-    @staticmethod
-    def _extract_videos(raw_json: str) -> Tuple[List[str], Optional[str]]:
+    def _build_continuation_url(self, continuation: str) -> Tuple[str, dict, dict]:
+        """Helper method to build the url and headers required to request
+        the next page of videos
+
+        :param str continuation: Continuation extracted from the json response
+            of the last page
+        :rtype: Tuple[str, dict, dict]
+        :returns: Tuple of an url and required headers for the next http
+            request
+        """
+        return (
+            (
+                # was changed to this format (and post requests)
+                # between 2022.11.06 and 2022.11.20
+                "https://www.youtube.com/youtubei/v1/browse?key="
+                f"{self.yt_api_key}"
+            ),
+            {
+                "X-YouTube-Client-Name": "1",
+                "X-YouTube-Client-Version": "2.20200720.00.02",
+            },
+            # extra data required for post request
+            {
+                "continuation": continuation,
+                "context": {
+                    "client": {
+                        "clientName": "WEB",
+                        "visitorData": self._visitor_data,
+                        "clientVersion": "2.20200720.00.02"
+                    }
+                }
+            }
+        )
+
+    def _extract_videos(self, raw_json: str) -> Tuple[List[str], Optional[str]]:
         """Extracts videos from a raw json page
 
         :param str raw_json: Input json extracted from the page or the last
@@ -182,6 +238,19 @@ class Channel(Playlist):
         except (KeyError, IndexError):
             # if there is an error, no continuation is available
             continuation = None
+
+        # only extract the video ids from the video data
+        videos_url = []
+        try:
+            # Extract id from videos and live
+            for x in videos:
+                videos_url.append(f"/watch?v="
+                                  f"{x['richItemRenderer']['content']['videoRenderer']['videoId']}")
+        except (KeyError, IndexError, TypeError):
+            # Extract id from short videos
+            for x in videos:
+                videos_url.append(f"/watch?v="
+                                  f"{x['richItemRenderer']['content']['reelItemRenderer']['videoId']}")
 
         # remove duplicates
         return (
